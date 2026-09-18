@@ -1,0 +1,92 @@
+policy:
+  id: "itsec_win_core_hardening"
+  file: "itsec_win_core-hardening.yml"
+  name: "ITSEC — Windows Server / Windows 11 Core / Platform Hardening (AD & GPO Ready)"
+  description: "Custom baseline: Secure Boot, driver signature enforcement, Lsa/Credential Guard, Attack Surface Reduction rules, Defender Tamper Protection."
+  references:
+    - https://www.cisecurity.org/benchmark/microsoft_windows_server
+    - https://learn.microsoft.com/en-us/windows/security/identity-protection/credential-guard/
+
+requirements:
+  title: "Windows Operating System Detection"
+  description: "Confirms the host is running Windows by checking a core registry key."
+  condition: all
+  rules:
+    - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion -> ProductName'
+
+checks:
+  # ---------------- Platform / Boot Integrity ----------------
+  - id: 1801
+    title: "Secure Boot is enabled"
+    description: "Checks 'Confirm-SecureBootUEFI' returns True."
+    rationale: "Secure Boot verifies the cryptographic signature of the boot chain before allowing execution, blocking bootkits."
+    remediation: "Enable Secure Boot in UEFI firmware settings."
+    compliance:
+      - cis: ["custom"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "Confirm-SecureBootUEFI" -> r:^True$'
+
+  - id: 1802
+    title: "Driver signature enforcement is not disabled (no test signing)"
+    description: "Checks 'bcdedit /enum' via Sysnative to bypass Wow64 redirection and ensure testsigning is off."
+    rationale: "Test signing mode allows unsigned kernel-mode drivers to load, removing code-signing gates."
+    remediation: "Run 'bcdedit /set testsigning off' and reboot."
+    compliance:
+      - cis: ["custom"]
+    condition: none
+    rules:
+      # Использование Sysnative решает проблему ошибки (2) "The system cannot find the file specified"
+      - 'c:C:\Windows\Sysnative\bcdedit.exe /enum -> r:testsigning\s+(Yes|Да)'
+
+  # ---------------- Lsa Protection & Credential Guard ----------------
+  - id: 1803
+    title: "LSA Protection (RunAsPPL) is enabled"
+    description: "Checks RunAsPPL=1 or 2 under HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa."
+    rationale: "LSA Protection runs lsass.exe as a Protected Process, mitigating Mimikatz-style credential dumping."
+    remediation: "Set HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa -> RunAsPPL -> 1."
+    compliance:
+      - cis: ["custom"]
+    condition: any
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Lsa -> RunAsPPL -> 1'
+      - 'r:HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Lsa -> RunAsPPL -> 2'
+
+  - id: 1804
+    title: "Credential Guard (virtualization-based security) is enabled"
+    description: "Checks Virtualization-Based Security and LsaCfgFlags configuration."
+    rationale: "Credential Guard isolates secrets in a hardware-virtualized container isolated from the main OS."
+    remediation: "Turn on Virtualization Based Security with Credential Guard enabled via GPO."
+    compliance:
+      - cis: ["custom"]
+    condition: all
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\DeviceGuard -> EnableVirtualizationBasedSecurity -> 1'
+      # Исправлен регистр пути Lsa с LSA на Lsa
+      - 'r:HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Lsa -> LsaCfgFlags -> r:^[12]$'
+
+  # ---------------- Attack Surface Reduction via PowerShell (GPO/MDE Compatible) ----------------
+  - id: 1805
+    title: "Key Attack Surface Reduction (ASR) rules are enabled"
+    description: "Checks high-value ASR rules via PowerShell to bypass empty GPO policy registry keys."
+    rationale: "Blocks Office from creating child processes and blocks execution of potentially obfuscated scripts."
+    remediation: "Set-MpPreference -AttackSurfaceReductionRules_Ids D4F940AB-401B-4EFC-AADC-AD5F3C50688A,5BEB7EFE-FD9A-4556-801D-275E5FFC04CC -AttackSurfaceReductionRules_Actions Enabled."
+    compliance:
+      - cis: ["custom"]
+    condition: all
+    rules:
+      # Проверяем состояние правил напрямую через защитник, 1 = Block, кавычки внутри PowerShell команды удвоены
+      - 'c:powershell.exe -NoProfile -Command "(Get-MpPreference).AttackSurfaceReductionRules_Ids | Where-Object {$_ -eq ''D4F940AB-401B-4EFC-AADC-AD5F3C50688A''} | ForEach-Object { (Get-MpPreference).AttackSurfaceReductionRules_Actions[([array]::IndexOf((Get-MpPreference).AttackSurfaceReductionRules_Ids, $_))] }" -> r:^1$'
+      - 'c:powershell.exe -NoProfile -Command "(Get-MpPreference).AttackSurfaceReductionRules_Ids | Where-Object {$_ -eq ''5BEB7EFE-FD9A-4556-801D-275E5FFC04CC''} | ForEach-Object { (Get-MpPreference).AttackSurfaceReductionRules_Actions[([array]::IndexOf((Get-MpPreference).AttackSurfaceReductionRules_Ids, $_))] }" -> r:^1$'
+
+  # ---------------- Anti-Tampering ----------------
+  - id: 1806
+    title: "Windows Defender Tamper Protection is enabled"
+    description: "Checks Get-MpComputerStatus reports IsTamperProtected=True."
+    rationale: "Prevents attackers with local admin privileges from turning off the antivirus protection."
+    remediation: "Enable Tamper Protection centralized via Intune or Microsoft Defender for Endpoint."
+    compliance:
+      - cis: ["custom"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-MpComputerStatus).IsTamperProtected" -> r:^True$'
