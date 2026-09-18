@@ -1,0 +1,112 @@
+policy:
+  id: "itsec_win_audit_logging"
+  file: "itsec_win_audit-logging.yml"
+  name: "ITSEC — Windows Server / Windows 11 Auditing & Logging (AD & GPO Ready)"
+  description: "Custom baseline adapted for Active Directory: Advanced Audit Policy, Security event log sizing, PowerShell script block/module logging via effective configurations."
+  references:
+    - https://cisecurity.org
+
+requirements:
+  title: "Windows Operating System Detection"
+  description: "Confirms the host is running Windows by checking a core registry key to avoid language lock with CLI tools."
+  condition: all
+  rules:
+    - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion -> ProductName'
+
+checks:
+  # ---------------- Advanced Audit Policy via PowerShell (Ignores OS Language) ----------------
+  - id: 1501
+    title: "Logon events audited (Success and Failure)"
+    description: "Checks effective audit policy for Logon subcategory."
+    rationale: "Failed logons are your primary signal for brute-force attempts; successful logons provide the audit trail."
+    remediation: "Configure GPO: Computer Configuration > Windows Settings > Security Settings > Advanced Audit Policy Configuration > Logon/Logoff > Audit Logon -> Success and Failure."
+    compliance:
+      - cis: ["17.5.1"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-AuditPolicy -Subcategory ''Logon'').Auditing" -> r:(Success and Failure|Success|Failure|Успех и отказ|Успех|Отказ)'
+
+  - id: 1502
+    title: "Process creation audited with command-line logging"
+    description: "Checks effective process creation audit and registry setting for command-line inclusion."
+    rationale: "Process creation with full command-line capture provides critical EDR-grade process visibility."
+    remediation: "Enable 'Audit Process Creation' (Success) in GPO and set HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\\Audit -> ProcessCreationIncludeCmdLine_Enabled -> 1."
+    compliance:
+      - cis: ["17.3.1"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-AuditPolicy -Subcategory ''Process Creation'').Auditing" -> r:(Success|Успех)'
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Audit -> ProcessCreationIncludeCmdLine_Enabled -> 1'
+
+  - id: 1503
+    title: "Account management events audited (Success and Failure)"
+    description: "Checks effective audit policy for User Account Management subcategory."
+    rationale: "Account creation, deletion, and group membership changes are critical for tracking persistence mechanisms."
+    remediation: "Enable Advanced Audit Policy: Account Management > Audit User Account Management -> Success and Failure."
+    compliance:
+      - cis: ["17.2.1"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-AuditPolicy -Subcategory ''User Account Management'').Auditing" -> r:(Success and Failure|Success|Failure|Успех и отказ|Успех|Отказ)'
+
+  - id: 1504
+    title: "Security group management events audited"
+    description: "Checks effective audit policy for Security Group Management subcategory."
+    rationale: "Being added to a privileged group is an immediate, actionable privilege-escalation signal."
+    remediation: "Enable Advanced Audit Policy: Account Management > Audit Security Group Management -> Success."
+    compliance:
+      - cis: ["17.2.4"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-AuditPolicy -Subcategory ''Security Group Management'').Auditing" -> r:(Success|Успех)'
+
+  # ---------------- Event log configuration via CIM/WMI (Bypasses empty Registry Keys) ----------------
+  - id: 1505
+    title: "Security event log has an adequate maximum size"
+    description: "Checks the Security log's actual current MaxSize is at least 196608 KB (192 MB) via active OS configuration."
+    rationale: "A too-small Security log rotates out old events quickly under normal load — and even faster under attack."
+    remediation: "GPO: Computer Configuration > Windows Settings > Security Settings > Event Log > Maximum security log size = 196608 KB or higher."
+    compliance:
+      - cis: ["18.9.27.2.2"]
+    condition: all
+    rules:
+      # Проверяем физический размер файла журнала напрямую у системы (196608 KB = 201326592 Bytes)
+      - 'c:powershell.exe -NoProfile -Command "(Get-CimInstance -ClassName Win32_NTEventlogFile | Where-Object {$_.LogfileName -eq ''Security''}).MaxFileSize" -> n:^(\d+)$ compare >= 201326592'
+
+  # ---------------- PowerShell logging (Checks multiple GPO deployment paths) ----------------
+  - id: 1506
+    title: "PowerShell Script Block Logging enabled"
+    description: "Checks if Script Block Logging is active either via Group Policy registry or local machine setup."
+    rationale: "Script Block Logging captures the actual PowerShell code executed — including code deobfuscated at runtime."
+    remediation: "Enable 'Turn on PowerShell Script Block Logging' via GPO."
+    compliance:
+      - cis: ["18.9.100.1"]
+    condition: any
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging -> EnableScriptBlockLogging -> 1'
+      - 'c:powershell.exe -NoProfile -Command "(Get-ItemProperty -Path ''HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'' -ErrorAction SilentlyContinue).EnableScriptBlockLogging" -> r:1'
+
+  - id: 1507
+    title: "PowerShell Module Logging enabled"
+    description: "Checks if Module Logging is active via registry policy paths."
+    rationale: "Module logging records pipeline execution details for loaded modules, complementing Script Block Logging."
+    remediation: "Enable 'Turn on PowerShell Module Logging' via GPO."
+    compliance:
+      - cis: ["18.9.100.2"]
+    condition: any
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging -> EnableModuleLogging -> 1'
+      - 'c:powershell.exe -NoProfile -Command "(Get-ItemProperty -Path ''HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging'' -ErrorAction SilentlyContinue).EnableModuleLogging" -> r:1'
+
+  # ---------------- Wazuh integration ----------------
+  - id: 1508
+    title: "Wazuh agent configured to collect the Security and PowerShell event channels"
+    description: "Checks the agent's local ossec.conf has eventchannel entries for at least 'Security' and 'Microsoft-Windows-PowerShell/Operational'."
+    rationale: "Audit policies only matter if Wazuh is actually configured to forward and collect these specific event logs."
+    remediation: "Verify that <localfile> entries for Security and Microsoft-Windows-PowerShell/Operational are present in ossec.conf/agent.conf."
+    compliance:
+      - cis: ["custom"]
+    condition: all
+    rules:
+      - 'f:C:\Program Files (x86)\ossec-agent\ossec.conf -> r:<location>Security</location>'
+      - 'f:C:\Program Files (x86)\ossec-agent\ossec.conf -> r:<location>Microsoft-Windows-PowerShell/Operational</location>'
