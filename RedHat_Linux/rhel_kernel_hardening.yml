@@ -1,0 +1,135 @@
+policy:
+  id: "itsec_redos_mac_kernel_hardening"
+  file: "itsec_redos_mac-kernel-hardening.yml"
+  name: "ITSEC — RED OS Mandatory Access Control (SELinux) & Kernel Module Hardening"
+  description: "Custom baseline: SELinux Enforcing mode and AVC denial visibility, disabling unused/legacy kernel modules (filesystems, USB storage, DCCP/SCTP/RDS/TIPC)"
+  references:
+    - https://redos.red-soft.ru/base/redos-8_0/8_0-security/8_0-selinux/8_0-selinux_doc/
+    - https://www.cisecurity.org/benchmark/oracle_linux
+
+requirements:
+  title: "Base SELinux tooling presence"
+  description: "Confirms SELinux userspace tools are available before running checks."
+  condition: all
+  rules:
+    - 'c:getenforce -> r:\w'
+
+checks:
+  # ---------------- SELinux / Mandatory Access Control ----------------
+  - id: 601
+    title: "SELinux is running in Enforcing mode (live state)"
+    description: "Checks the live output of 'getenforce' is exactly 'Enforcing', not 'Permissive' or 'Disabled'."
+    rationale: "Permissive mode logs policy violations but does not actually block them — it gives the appearance of protection while providing none; a process compromised via a vulnerable service can still read/write/execute outside its intended domain exactly as if SELinux weren't there at all. Enforcing is the only mode where mandatory access control is actually enforced rather than merely observed."
+    remediation: "Run 'setenforce 1' for an immediate switch to Enforcing (does not survive reboot on its own — see check 602 for persistence). Before enforcing on a host that has run Permissive for a while, review 'ausearch -m avc -ts recent' for denials that would newly block legitimate activity, and address them (via audit2allow or fixing file contexts) rather than staying Permissive indefinitely."
+    compliance:
+      - cis: ["1.6.1.2"]
+    condition: all
+    rules:
+      - 'c:getenforce -> r:^Enforcing$'
+
+  - id: 602
+    title: "SELinux Enforcing mode persists across reboot"
+    description: "Checks /etc/selinux/config sets 'SELINUXTYPE' is defined and 'SELINUX=enforcing', so the live Enforcing state from check 601 survives a reboot instead of silently reverting."
+    rationale: "A host can be Enforcing right now (e.g. set manually with setenforce) while still being configured to boot into Permissive or Disabled — meaning the very next reboot, planned maintenance, or crash-recovery quietly drops MAC protection with no alert. Persisting the setting in config is what makes Enforcing the durable state rather than a manual, forgettable workaround."
+    remediation: "Set 'SELINUX=enforcing' in /etc/selinux/config. If currently Disabled (not just Permissive), a reboot is required after this change for SELinux to actually initialize and label the filesystem — plan a maintenance window and expect an initial autorelabel pass on first boot."
+    compliance:
+      - cis: ["1.6.1.1"]
+    condition: all
+    rules:
+      - 'f:/etc/selinux/config -> r:^SELINUX\s*=\s*enforcing'
+
+  - id: 603
+    title: "SELinux policy type is a real enforcement policy (targeted or mls)"
+    description: "Checks /etc/selinux/config sets 'SELINUXTYPE' to 'targeted' or 'mls', not left blank or set to a minimal/no-op policy."
+    rationale: "Enforcing mode with an empty or minimal policy set still enforces essentially nothing meaningful — the policy type determines which domains and rules actually exist to be enforced. 'targeted' (protects a defined set of network-facing/system services) is the standard baseline; 'mls' (Multi-Level Security) is the stricter option relevant for classified/multi-level environments and more likely to be what a formally certified СЗИ/ФСТЭК-compliant deployment requires."
+    remediation: "Set 'SELINUXTYPE=targeted' (or 'mls' if your certification/compliance requirements call for full multi-level security) in /etc/selinux/config."
+    compliance:
+      - cis: ["1.6.1.4"]
+    condition: all
+    rules:
+      - 'f:/etc/selinux/config -> r:^SELINUXTYPE\s*=\s*(targeted|mls)'
+
+  - id: 604
+    title: "AVC denials are collected for visibility in Wazuh"
+    description: "Checks the agent's ossec.conf has a <localfile> entry reading /var/log/audit/audit.log (where AVC denial records land when auditd is running alongside an Enforcing SELinux), or an equivalent syslog/journald source that would carry them."
+    rationale: "An AVC denial is SELinux actively blocking something a process tried to do — this is exactly the kind of signal a SOC wants visibility into: it can mean a legitimate app misconfiguration (noisy but benign), or it can mean a compromised process attempting something outside its expected behavior (a strong detection signal). Enforcing mode without this log reaching Wazuh means denials happen, protect the host, and are never seen by anyone."
+    remediation: 'Add to ossec.conf/agent.conf: <localfile><log_format>audit</log_format><location>/var/log/audit/audit.log</location></localfile> (Wazuh has a built-in audit log_format that parses AVC records). Confirm on the manager side that AVC-specific detection rules are enabled/tuned rather than left at generic audit noise level. Note: like checks 506-508 in the software-integrity policy, this reads the agent''s local ossec.conf — if pushed only via a non-merged group agent.conf, verify separately via the Wazuh API.'
+    compliance:
+      - cis: ["custom"]
+    condition: all
+    rules:
+      - 'f:/var/ossec/etc/ossec.conf -> r:audit && r:/var/log/audit/audit.log'
+
+  # ---------------- Kernel module hardening ----------------
+  - id: 605
+    title: "Legacy/uncommon filesystem kernel modules disabled"
+    description: "Checks that 'modprobe -n -v' for each of cramfs, freevxfs, jffs2, hfs, hfsplus, squashfs, and udf reports an 'install /bin/true' (or /bin/false) override, meaning the module is blocked from loading rather than left auto-loadable."
+    rationale: "These filesystem drivers exist mainly for legacy media/device compatibility (old CD-ROM/optical formats, Mac-native filesystems, embedded/firmware images, some USB media) and are rarely needed on a server. Each one is additional kernel attack surface that can be triggered simply by mounting a crafted filesystem image — a known vector class for kernel privilege-escalation bugs, and one that's easy to close off entirely when the filesystem type is never legitimately used."
+    remediation: 'Create /etc/modprobe.d/itsec-blacklist-filesystems.conf with one line per module: install cramfs /bin/true, install freevxfs /bin/true, install jffs2 /bin/true, install hfs /bin/true, install hfsplus /bin/true, install squashfs /bin/true, install udf /bin/true. Note: squashfs is used by some containerization/snap tooling — verify it is genuinely unused before disabling.'
+    compliance:
+      - cis: ["1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5", "1.1.1.6"]
+    condition: all
+    rules:
+      - 'c:modprobe -n -v cramfs -> r:install\s+/bin/(true|false)'
+      - 'c:modprobe -n -v freevxfs -> r:install\s+/bin/(true|false)'
+      - 'c:modprobe -n -v jffs2 -> r:install\s+/bin/(true|false)'
+      - 'c:modprobe -n -v hfs -> r:install\s+/bin/(true|false)'
+      - 'c:modprobe -n -v hfsplus -> r:install\s+/bin/(true|false)'
+      - 'c:modprobe -n -v squashfs -> r:install\s+/bin/(true|false)'
+      - 'c:modprobe -n -v udf -> r:install\s+/bin/(true|false)'
+
+  - id: 606
+    title: "USB storage kernel module disabled (if not operationally required)"
+    description: "Checks that 'modprobe -n -v usb-storage' reports an install override blocking the module from loading."
+    rationale: "USB mass-storage support is the primary vector for both data exfiltration (copying sensitive data to a USB drive plugged into a server) and malware introduction (autorun-style or manually-executed payloads from removable media) on physical or hybrid infrastructure. Servers almost never have a legitimate operational need for USB storage; disabling the module removes the vector at the kernel level rather than relying on physical access controls alone."
+    remediation: "Create /etc/modprobe.d/itsec-blacklist-usb-storage.conf: install usb-storage /bin/true. If this host is a VM with no physical USB exposure, this is lower-priority than on bare-metal hosts, but still worth closing given its low operational cost."
+    compliance:
+      - cis: ["1.1.24"]
+    condition: all
+    rules:
+      - 'c:modprobe -n -v usb-storage -> r:install\s+/bin/(true|false)'
+
+  - id: 607
+    title: "DCCP protocol kernel module disabled"
+    description: "Checks that 'modprobe -n -v dccp' reports an install override blocking the module."
+    rationale: "DCCP (Datagram Congestion Control Protocol) is a niche transport protocol essentially unused in typical enterprise/server workloads. An unused, rarely-audited protocol implementation in the kernel is exposure with no corresponding operational benefit — disable it unless something on the host specifically requires it."
+    remediation: "Create /etc/modprobe.d/itsec-blacklist-net-protocols.conf: install dccp /bin/true."
+    compliance:
+      - cis: ["3.3.1"]
+    condition: all
+    rules:
+      - 'c:modprobe -n -v dccp -> r:install\s+/bin/(true|false)'
+
+  - id: 608
+    title: "SCTP protocol kernel module disabled (if unused)"
+    description: "Checks that 'modprobe -n -v sctp' reports an install override blocking the module. SCTP is genuinely used in some telecom/signaling (SS7/Diameter-adjacent) and certain clustering setups — confirm it is not required before disabling."
+    rationale: "Same rationale class as DCCP: an uncommon protocol stack is unnecessary kernel surface on any host that doesn't specifically need it. Unlike DCCP, SCTP does have real legitimate uses in specific domains (telecom signaling, some HA clustering software), so verify actual usage before blanket-disabling across your fleet."
+    remediation: "If confirmed unused: create /etc/modprobe.d/itsec-blacklist-net-protocols.conf line: install sctp /bin/true. If any workload on this host uses SCTP, exclude this specific check for that host group rather than disabling a protocol something depends on."
+    compliance:
+      - cis: ["3.3.2"]
+    condition: all
+    rules:
+      - 'c:modprobe -n -v sctp -> r:install\s+/bin/(true|false)'
+
+  - id: 609
+    title: "RDS protocol kernel module disabled"
+    description: "Checks that 'modprobe -n -v rds' reports an install override blocking the module."
+    rationale: "RDS (Reliable Datagram Sockets) is primarily used by specific clustered database products (historically Oracle RAC) and is otherwise unused. Absent a specific dependency, it's unnecessary kernel network-stack surface, consistent with the other uncommon-protocol checks in this policy."
+    remediation: "Create /etc/modprobe.d/itsec-blacklist-net-protocols.conf line: install rds /bin/true."
+    compliance:
+      - cis: ["3.3.3"]
+    condition: all
+    rules:
+      - 'c:modprobe -n -v rds -> r:install\s+/bin/(true|false)'
+
+  - id: 610
+    title: "TIPC protocol kernel module disabled"
+    description: "Checks that 'modprobe -n -v tipc' reports an install override blocking the module."
+    rationale: "TIPC (Transparent Inter-Process Communication) is designed for intra-cluster node communication and has essentially no relevance on a general-purpose server outside that specific clustering context. Disabling it closes off another rarely-used protocol implementation as attack surface."
+    remediation: "Create /etc/modprobe.d/itsec-blacklist-net-protocols.conf line: install tipc /bin/true."
+    compliance:
+      - cis: ["3.3.4"]
+    condition: all
+    rules:
+      - 'c:modprobe -n -v tipc -> r:install\s+/bin/(true|false)'
+[root@wazuh-master RedHat-Linux]#
