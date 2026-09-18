@@ -1,0 +1,167 @@
+policy:
+  id: "itsec_rhel_access_hardening"
+  file: "itsec_rhel_access-hardening.yml"
+  name: "ITSEC — RHEL/Oracle Linux Access Hardening (SSH, PAM, sudo, Service Accounts)"
+  description: "Custom baseline: SSH hardening, PAM password quality/faillock, sudo restrictions, service account shell control"
+  references:
+    - https://www.cisecurity.org/benchmark/oracle_linux
+
+requirements:
+  title: "sshd_config and PAM presence"
+  description: "Confirms the host has an OpenSSH server and standard PAM stack before running the checks below."
+  condition: all
+  rules:
+    - 'f:/etc/ssh/sshd_config'
+
+checks:
+  # ---------------- SSH Hardening ----------------
+  - id: 101
+    title: "SSH root login disabled"
+    description: "Checks that 'PermitRootLogin' in /etc/ssh/sshd_config is explicitly set to 'no', preventing direct interactive or key-based SSH login as root."
+    rationale: "Direct root SSH access removes the audit trail of *who* performed a privileged action — every session is attributed to 'root' instead of a named account. Forcing admins through a personal account + sudo ties privileged actions to an identity and lets you disable that identity individually if compromised, without touching the root account itself."
+    remediation: "Set 'PermitRootLogin no' in /etc/ssh/sshd_config and restart sshd."
+    compliance:
+      - cis: ["5.2.10"]
+    condition: all
+    rules:
+      - 'f:/etc/ssh/sshd_config -> r:^PermitRootLogin\s+no'
+
+  - id: 102
+    title: "SSH password authentication disabled (key-only)"
+    description: "Checks that 'PasswordAuthentication' in /etc/ssh/sshd_config is set to 'no', so SSH only accepts public-key (or other non-password) authentication."
+    rationale: "Passwords are subject to brute-force, credential stuffing, and phishing/reuse from other breached services. SSH key pairs are not guessable via online attack and can be individually revoked without a password reset process. This is the single highest-value SSH control against automated internet-facing scanning."
+    remediation: "Set 'PasswordAuthentication no' in /etc/ssh/sshd_config. Ensure all required admin/service accounts have authorized_keys deployed *before* enabling this, to avoid lockout."
+    compliance:
+      - cis: ["5.2.9"]
+    condition: all
+    rules:
+      - 'f:/etc/ssh/sshd_config -> r:^PasswordAuthentication\s+no'
+
+  - id: 103
+    title: "No weak SSH ciphers (CBC / legacy) enabled"
+    description: "Checks the 'Ciphers' directive does not include legacy or CBC-mode algorithms (3des-cbc, arcfour, blowfish, cast128, any *-cbc variant)."
+    rationale: "CBC-mode SSH ciphers are vulnerable to plaintext-recovery attacks (e.g. CVE-2008-5161-class issues) and arcfour/3des are cryptographically weak by modern standards. Restricting to AEAD/CTR ciphers (chacha20-poly1305, aes-gcm, aes-ctr) removes an entire class of transport-level attacks with no functional downside on any client from the last decade."
+    remediation: 'Set an explicit allowlist: Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr'
+    compliance:
+      - cis: ["5.2.13"]
+    condition: none
+    rules:
+      - 'f:/etc/ssh/sshd_config -> r:^Ciphers\s+.*(3des-cbc|arcfour|blowfish|cast128|-cbc)'
+
+  - id: 104
+    title: "No weak SSH MACs (md5 / 96-bit) enabled"
+    description: "Checks the 'MACs' directive does not include MD5-based or truncated 96-bit HMAC algorithms."
+    rationale: "MD5-based and 96-bit-truncated MACs offer materially weaker collision/forgery resistance than SHA-2 based ETM (encrypt-then-MAC) variants, making message tampering theoretically easier to achieve undetected. Since hmac-sha2-* is supported by every maintained SSH client, there's no compatibility trade-off to keeping the weak options enabled."
+    remediation: 'Set: MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256'
+    compliance:
+      - cis: ["5.2.14"]
+    condition: none
+    rules:
+      - 'f:/etc/ssh/sshd_config -> r:^MACs\s+.*(md5|-96)'
+
+  - id: 105
+    title: "SSH idle session timeout configured"
+    description: "Checks that 'ClientAliveInterval' is set to a non-zero value and 'ClientAliveCountMax' is explicitly set, so sshd actively probes and disconnects idle/dead sessions instead of holding them open indefinitely."
+    rationale: "An unattended, unlocked SSH session (e.g. a forgotten terminal on a shared jump host) is a standing privilege-escalation opportunity for anyone with physical or local access to that terminal. A bounded idle timeout (ClientAliveInterval 300 x ClientAliveCountMax 2 = ~10 min) closes that window without disrupting normal interactive use."
+    remediation: "Set 'ClientAliveInterval 300' and 'ClientAliveCountMax 2' in /etc/ssh/sshd_config."
+    compliance:
+      - cis: ["5.2.16", "5.2.17"]
+    condition: all
+    rules:
+      - 'f:/etc/ssh/sshd_config -> r:^ClientAliveInterval\s+\d+ && !r:^ClientAliveInterval\s+0\s*$'
+      - 'f:/etc/ssh/sshd_config -> r:^ClientAliveCountMax\s+\d+'
+
+  # ---------------- PAM / Password Quality ----------------
+  - id: 106
+    title: "pam_pwquality module enabled"
+    description: "Checks that 'pam_pwquality.so' is loaded in both /etc/pam.d/system-auth and /etc/pam.d/password-auth, meaning password-quality enforcement happens at the PAM layer for every path that sets a password (passwd, useradd -p, etc.), not just interactively."
+    rationale: "Without pam_pwquality, the OS accepts any string as a valid password regardless of length or complexity — application-level or documented policy alone is unenforceable and easy to bypass. Enforcing at the PAM layer guarantees the control applies system-wide, including to scripted/automated account provisioning."
+    remediation: "Install libpwquality (RHEL/OL: 'dnf install libpwquality') and ensure 'password requisite pam_pwquality.so' appears before pam_unix.so in system-auth and password-auth."
+    compliance:
+      - cis: ["5.5.5"]
+    condition: all
+    rules:
+      - 'f:/etc/pam.d/system-auth -> r:pam_pwquality.so'
+      - 'f:/etc/pam.d/password-auth -> r:pam_pwquality.so'
+
+  - id: 107
+    title: "Minimum password length >= 14"
+    description: "Checks that 'minlen' in /etc/security/pwquality.conf is set to 14 or higher."
+    rationale: "Password length is the dominant factor in resistance to offline brute-force/hash-cracking attacks — each additional character multiplies the keyspace far more than adding complexity classes does. 14 characters aligns with current NIST SP 800-63B / CIS guidance as a floor for accounts without MFA."
+    remediation: "Set 'minlen = 14' in /etc/security/pwquality.conf."
+    compliance:
+      - cis: ["5.5.5"]
+    condition: all
+    rules:
+      - 'f:/etc/security/pwquality.conf -> r:^minlen\s*=\s*(1[4-9]|[2-9]\d|\d{3,})'
+
+  - id: 108
+    title: "Password history (remember) configured, >= 5"
+    description: "Checks that pam_pwhistory.so (or pam_unix.so's remember= option) in /etc/pam.d/system-auth is configured to remember at least the last 5 passwords per account."
+    rationale: "Without history enforcement, users routinely defeat mandatory password rotation by cycling between two passwords (A -> B -> A). Remembering prior hashes forces genuinely new passwords at each change, which is the entire point of a rotation policy."
+    remediation: "Add 'remember=5' to the pam_pwhistory.so (preferred) or pam_unix.so line in /etc/pam.d/system-auth."
+    compliance:
+      - cis: ["5.5.5"]
+    condition: all
+    rules:
+      - 'f:/etc/pam.d/system-auth -> r:pam_pwhistory.so && r:remember=([5-9]|\d{2,})'
+
+  - id: 109
+    title: "pam_faillock account lockout configured"
+    description: "Checks that /etc/security/faillock.conf sets 'deny' to 5 or fewer failed attempts, and that pam_faillock.so is actually wired into /etc/pam.d/system-auth."
+    rationale: "Without a lockout threshold, local and SSH-password-based accounts (where still permitted, e.g. break-glass) are exposed to unlimited-attempt online brute-forcing. A deny=5 / unlock_time=900 policy stops credential-guessing attacks while keeping lockout duration short enough not to create a denial-of-service risk against legitimate users."
+    remediation: "Set 'deny = 5' and 'unlock_time = 900' in /etc/security/faillock.conf; confirm 'pam_faillock.so preauth' and 'pam_faillock.so authfail' lines are present and correctly ordered in system-auth."
+    compliance:
+      - cis: ["5.5.2"]
+    condition: all
+    rules:
+      - 'f:/etc/security/faillock.conf -> r:^deny\s*=\s*[1-5]\s*$'
+      - 'f:/etc/pam.d/system-auth -> r:pam_faillock.so'
+
+  # ---------------- sudo restrictions ----------------
+  - id: 110
+    title: "No global NOPASSWD:ALL grants in sudoers"
+    description: "Checks that no line in /etc/sudoers or any file under /etc/sudoers.d/ grants unrestricted 'NOPASSWD: ALL' privilege escalation."
+    rationale: "NOPASSWD:ALL means a compromised session or unattended terminal for that user is immediately equivalent to a full root compromise, with no re-authentication checkpoint. Requiring a password for sudo forces an attacker who has stolen a session token/cookie (but not the password) to still defeat an additional auth step before escalating."
+    remediation: "Remove bare 'NOPASSWD: ALL' entries from /etc/sudoers and /etc/sudoers.d/*. If passwordless sudo is operationally required, scope it to a specific, minimal command list instead (see check 12)."
+    compliance:
+      - cis: ["5.3.3"]
+    condition: none
+    rules:
+      - 'f:/etc/sudoers -> r:NOPASSWD:\s*ALL'
+      - 'd:/etc/sudoers.d -> r:.* -> r:NOPASSWD:\s*ALL'
+
+  - id: 111
+    title: "sudo command logging enabled"
+    description: "Checks that /etc/sudoers sets a 'Defaults logfile=...' directive and 'Defaults use_pty', so every sudo invocation and its full I/O is captured to a dedicated log rather than only appearing in generic auth logs (or not at all)."
+    rationale: "sudo actions are exactly the privileged commands a SOC needs full accountability for. use_pty prevents a user from spawning a subshell that escapes sudo's own logging, and a dedicated logfile (in addition to syslog/journald forwarding) gives a durable, tamper-evident record for incident response and compliance audits."
+    remediation: 'Add to /etc/sudoers via visudo: Defaults logfile="/var/log/sudo.log" and Defaults use_pty. Ensure /var/log/sudo.log is included in your Wazuh log collection / FIM scope.'
+    compliance:
+      - cis: ["5.3.4"]
+    condition: all
+    rules:
+      - 'f:/etc/sudoers -> r:^Defaults\s+.*logfile'
+      - 'f:/etc/sudoers -> r:^Defaults\s+.*use_pty'
+
+  - id: 112
+    title: "No blanket ALL=(ALL) ALL grants for non-admin users in sudoers.d"
+    description: "Checks /etc/sudoers.d/* for lines granting an individual user unrestricted 'ALL=(ALL) ALL' (or '(ALL:ALL) ALL') sudo rights, as opposed to a scoped command list."
+    rationale: "Blanket sudo grants make the principle of least privilege meaningless — a helpdesk or app-support account rarely needs full root, only a handful of service-restart/log-read commands. Scoping sudoers.d entries to explicit command paths (e.g. 'appuser ALL=(root) /usr/bin/systemctl restart myapp') limits blast radius if that specific account is compromised."
+    remediation: "Review each file in /etc/sudoers.d/ and replace 'ALL' command grants with an explicit, minimal command allowlist per role. Reserve unrestricted ALL grants for a small, named admin group (e.g. %wheel) only."
+    compliance:
+      - cis: ["5.3.1"]
+    condition: none
+    rules:
+      - 'd:/etc/sudoers.d -> r:.* -> r:^\s*[^#%]\S+\s+ALL\s*=\s*\(ALL(:ALL)?\)\s+ALL\s*$'
+
+  # ---------------- Service accounts ----------------
+  - id: 113
+    title: "Service accounts (UID < 1000, non-root) use nologin/false shell"
+    description: "Runs an awk pass over /etc/passwd counting accounts with UID below 1000 (system/service range, excluding UID 0) whose login shell is *not* /sbin/nologin or /bin/false. The check passes only when that count is exactly 0."
+    rationale: "System/service accounts (postgres, nginx, wazuh, etc.) exist to run daemons under a dedicated identity for process isolation and file-permission scoping — they are not meant to be logged into interactively. An interactive shell on a service account is an unnecessary and frequently-forgotten attack surface: if the account's credentials or an SSH key are ever exposed, nologin/false turns what would be a shell foothold into a dead end."
+    remediation: "For each offending account, run: usermod -s /sbin/nologin <account>. Audit before applying — a small number of legitimate service accounts (e.g. accounts used for scripted SFTP/rsync via ForceCommand) may need /usr/sbin/nologin plus an SSH-level ForceCommand instead of full shell removal."
+    compliance:
+      - cis: ["6.2.11"]
+    condition: all
+    rules:
+      - 'c:awk -F: "{if ($3<1000 && $3!=0 && $7 !~ /nologin|false/) c++} END{print c+0}" /etc/passwd -> r:^0$'
