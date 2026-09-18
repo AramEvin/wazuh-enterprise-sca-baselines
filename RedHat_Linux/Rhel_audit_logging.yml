@@ -1,0 +1,170 @@
+policy:
+  id: "itsec_rhel_audit_logging"
+  file: "itsec_rhel_audit-logging.yml"
+  name: "ITSEC — RHEL/Oracle Linux Auditing & Logging"
+  description: "Custom baseline: Linux Audit subsystem (auditd) syscall/file watch rules, rsyslog centralization and logrotate retention, journald persistence and Wazuh integration"
+  references:
+    - https://www.cisecurity.org/benchmark/oracle_linux
+    - https://man7.org/linux/man-pages/man7/audit.rules.7.html
+
+requirements:
+  title: "Base logging stack presence"
+  description: "Confirms auditd and journald configuration files exist before running checks."
+  condition: all
+  rules:
+    - 'f:/etc/audit/auditd.conf'
+    - 'f:/etc/systemd/journald.conf'
+
+checks:
+  # ---------------- auditd: service state ----------------
+  - id: 301
+    title: "auditd service enabled and running"
+    description: "Checks that the auditd systemd unit is both enabled (starts at boot) and currently active."
+    rationale: "Every audit rule below is meaningless if the auditd daemon itself isn't running or doesn't survive a reboot. This is a prerequisite gate — an attacker's first move after gaining a foothold           is often to stop or mask the audit daemon to blind detection, so verifying live state (not just config presence) matters."
+    remediation: "systemctl enable --now auditd. If auditd is masked, unmask first: systemctl unmask auditd."
+    compliance:
+      - cis: ["4.1.1.1"]
+    condition: all
+    rules:
+      - 'c:systemctl is-enabled auditd -> r:^enabled$'
+      - 'c:systemctl is-active auditd -> r:^active$'
+
+  # ---------------- auditd: syscall/file watch rules ----------------
+  - id: 302
+    title: "Audit rules track permission changes (chmod/chown family)"
+    description: "Checks the compiled ruleset in /etc/audit/audit.rules contains a syscall watch on the chmod family (chmod, fchmod, fchmodat) and the chown family (chown, fchown, fchownat, lchown), tagged           with a 'perm_mod' key for both real users (auid>=1000) and root."
+    rationale: "Discretionary access control changes (chmod/chown) are how an attacker who has gained a foothold widens their own access — e.g. making a script world-writable to plant a payload, or handing           ownership of a sensitive file to a compromised service account. Without these watches, that entire class of privilege-widening activity leaves no audit trail."
+    remediation: 'Add to /etc/audit/rules.d/50-perm_mod.rules:\n-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -k perm_mod\n-a always,exit -F arch=b64 -S chown,fchown,fcho          wnat,lchown -F auid>=1000 -F auid!=unset -k perm_mod\nThen: augenrules --load (or auditctl -R for immediate effect).'
+    compliance:
+      - cis: ["4.1.3.14"]
+    condition: all
+    rules:
+      - 'f:/etc/audit/audit.rules -> r:chmod && r:perm_mod'
+      - 'f:/etc/audit/audit.rules -> r:chown && r:perm_mod'
+
+  - id: 303
+    title: "Audit rules track kill/signal syscalls"
+    description: "Checks the compiled ruleset watches the 'kill' syscall, tagged with a dedicated key so signal-sending events are searchable independently of other syscall audit noise."
+    rationale: "Killing a process — especially the Wazuh agent, auditd itself, rsyslog, or another security/logging daemon — is a common step in an attacker's attempt to blind monitoring before continuing           an intrusion. An explicit audit trail of who sent which signal to which PID gives you the forensic breadcrumb that logging *stopped* was itself a hostile act, not an outage, and lets you correlate signal t          iming with the rest of an incident timeline."
+    remediation: 'Add to /etc/audit/rules.d/50-process_signal.rules:\n-a always,exit -F arch=b64 -S kill -F auid>=1000 -F auid!=unset -k process_signal\nThen: augenrules --load.'
+    compliance:
+      - cis: ["custom"]
+    condition: all
+    rules:
+      - 'f:/etc/audit/audit.rules -> r:-S\s+kill && r:process_signal'
+
+  - id: 304
+    title: "Audit rules track system time changes"
+    description: "Checks the compiled ruleset watches time-setting syscalls (adjtimex, settimeofday, clock_settime) and write access to /etc/localtime, tagged with the 'time-change' key."
+    rationale: "Manipulating the system clock is a classic technique for confusing log timelines, defeating time-bound access controls (expired certs/tokens appearing valid), or creating gaps in correlated           evidence across hosts. Auditing every time change makes clock tampering itself a logged, alertable event rather than a silent way to muddy an investigation."
+    remediation: 'Add to /etc/audit/rules.d/50-time-change.rules:\n-a always,exit -F arch=b64 -S adjtimex,settimeofday,clock_settime -k time-change\n-w /etc/localtime -p wa -k time-change\nThen: augenrules           --load.'
+    compliance:
+      - cis: ["4.1.3.3"]
+    condition: all
+    rules:
+      - 'f:/etc/audit/audit.rules -> r:-S\s+.*(adjtimex|settimeofday|clock_settime) && r:time-change'
+      - 'f:/etc/audit/audit.rules -> r:/etc/localtime && r:time-change'
+
+  - id: 305
+    title: "Audit rules track network configuration file changes"
+    description: "Checks the compiled ruleset watches write access to core network identity/config files: /etc/hosts, /etc/sysconfig/network, and /etc/issue (and /etc/issue.net), tagged with a 'system-loca          le' or equivalent key."
+    rationale: "Changes to hostname resolution (/etc/hosts) or network config are a common technique for traffic redirection (DNS/host pinning attacks), persistence, or disguising a compromised host's iden          tity from other systems. Because these files change rarely under normal operations, any write is a high-signal event worth a dedicated audit key so it's cheap to alert on."
+    remediation: 'Add to /etc/audit/rules.d/50-system-locale.rules:\n-w /etc/hosts -p wa -k system-locale\n-w /etc/sysconfig/network -p wa -k system-locale\n-w /etc/issue -p wa -k system-locale\n-w /etc/is          sue.net -p wa -k system-locale\nThen: augenrules --load. Adjust paths for NetworkManager-managed configs under /etc/NetworkManager/system-connections/ if used.'
+    compliance:
+      - cis: ["4.1.3.10"]
+    condition: all
+    rules:
+      - 'f:/etc/audit/audit.rules -> r:/etc/hosts && r:system-locale'
+
+  - id: 306
+    title: "Audit configuration is immutable (-e 2) once loaded"
+    description: "Checks that the compiled ruleset includes the '-e 2' directive, which makes the audit configuration immutable until the next reboot — no further rule changes, deletions, or auditd restart          s are possible without rebooting."
+    rationale: "Without immutability, an attacker with root can simply run 'auditctl -D' or reload a stripped-down ruleset to remove the watches above, then restore them afterward, leaving no trace in the           audit log itself (rule changes are logged, but deleting all rules deletes that evidence too, and a restart can bypass some logging). '-e 2' forces any tampering attempt to require a reboot, which is itself           a loud, alertable event."
+    remediation: "Add '-e 2' as the LAST line in your compiled rules (e.g. in /etc/audit/rules.d/99-finalize.rules, which sorts after other rule files), then augenrules --load. Note: this requires a reboot           to apply changes to rules going forward — plan rule changes accordingly."
+    compliance:
+      - cis: ["4.1.1.3"]
+    condition: all
+    rules:
+      - 'f:/etc/audit/audit.rules -> r:^-e\s+2\s*$'
+
+  - id: 307
+    title: "auditd disk-space handling configured to avoid silent log loss"
+    description: "Checks /etc/audit/auditd.conf sets 'max_log_file_action' to a retention-preserving value (keep_logs or rotate, not the default-unsafe 'ignore'/'suspend') and 'space_left_action' to a valu          e that raises an alert (email or syslog) rather than silently doing nothing."
+    rationale: "The default auditd behavior on disk pressure can silently stop logging or drop old logs without any alert. For a system whose audit trail feeds your SOC, an audit gap during exactly the per          iod an attacker fills the disk to cause it is a realistic evasion technique. Configuring active alerting on low space closes that blind spot."
+    remediation: "In /etc/audit/auditd.conf set: max_log_file_action = keep_logs (or rotate) and space_left_action = syslog (or email, if MTA is configured). Restart: service auditd restart (requires a rea          l restart, not just a config reload, for some settings)."
+    compliance:
+      - cis: ["4.1.2.2"]
+    condition: all
+    rules:
+      - 'f:/etc/audit/auditd.conf -> r:^max_log_file_action\s*=\s*(keep_logs|rotate)'
+      - 'f:/etc/audit/auditd.conf -> r:^space_left_action\s*=\s*(syslog|email)'
+
+  # ---------------- rsyslog: centralization & retention ----------------
+  - id: 308
+    title: "rsyslog service enabled and running"
+    description: "Checks the rsyslog systemd unit is enabled and active."
+    rationale: "rsyslog is the transport layer moving local logs off-host to your central log server. If it's stopped or fails to start after a reboot, every log generated locally in the meantime is retain          ed only until local rotation deletes it — the centralized copy your SOC investigates from simply never receives it."
+    remediation: "systemctl enable --now rsyslog."
+    compliance:
+      - cis: ["4.2.1.1"]
+    condition: all
+    rules:
+      - 'c:systemctl is-enabled rsyslog -> r:^enabled$'
+      - 'c:systemctl is-active rsyslog -> r:^active$'
+
+  - id: 309
+    title: "rsyslog forwards logs to a remote/central log server"
+    description: "Checks /etc/rsyslog.conf or any file under /etc/rsyslog.d/ contains a forwarding action to a remote destination — either legacy '@@' (TCP) / '@' (UDP) target syntax, or a modern omfwd/omr          elp action block."
+    rationale: "Logs that only ever live on the host they were generated on are trivially destroyed by an attacker who gains root there — 'rm -rf /var/log' or a targeted delete of the relevant file erases           the evidence along with the intrusion. Real-time forwarding to a server the compromised host cannot write back to (append-only/write-once ingestion) is what actually makes local log tampering detectable ra          ther than simply erasing the record."
+    remediation: 'Add to /etc/rsyslog.d/60-forward.conf, e.g.: *.* action(type="omfwd" target="<log-server-ip-or-host>" port="6514" protocol="tcp" action.resumeRetryCount="-1" queue.type="linkedList" queue          .filename="fwdqueue") — prefer TLS (omfwd with StreamDriver=gtls) over plaintext syslog forwarding, especially over untrusted network segments. Restart: systemctl restart rsyslog.'
+    compliance:
+      - cis: ["4.2.1.4"]
+    condition: all
+    rules:
+      - 'f:/etc/rsyslog.conf -> r:^\s*\*\.\*\s+@|^\s*action\(.*type="omfwd"'
+      - 'd:/etc/rsyslog.d -> r:.* -> r:@@|omfwd|omrelp'
+
+  - id: 310
+    title: "logrotate retention configured for local logs"
+    description: "Checks /etc/logrotate.conf (or the relevant /etc/logrotate.d/ entries) sets a 'rotate' count of at least 30 cycles, so local copies persist long enough to bridge any gap in central log de          livery."
+    rationale: "Central log shipping is the durable copy, but local retention is your fallback during network partitions or a rsyslog outage — if local rotation deletes logs after only a few days, a delive          ry gap that isn't noticed quickly enough becomes a permanent evidence gap. 30 days is a common minimum baseline; align it with your actual incident-detection SLA."
+    remediation: "Set 'rotate 30' (or higher) in /etc/logrotate.conf, and confirm application-specific configs under /etc/logrotate.d/ that override the global default don't set a shorter rotate count."
+    compliance:
+      - cis: ["4.2.4"]
+    condition: all
+    rules:
+      - 'f:/etc/logrotate.conf -> r:^rotate\s+([3-9]\d|[1-9]\d{2,})'
+
+  # ---------------- journald: persistence & Wazuh integration ----------------
+  - id: 311
+    title: "journald configured for persistent storage"
+    description: "Checks /etc/systemd/journald.conf sets 'Storage=persistent', writing the journal to /var/log/journal (surviving reboots) instead of the default volatile /run/log/journal (tmpfs, lost on r          eboot/crash)."
+    rationale: "Volatile-only journal storage means a crash, forced reboot, or power event during an incident destroys exactly the boot-time and early-startup logs that are often most relevant to understan          ding how a compromise began. Persistent storage is a one-line config change with no real downside on a server with normal disk headroom."
+    remediation: "Set 'Storage=persistent' in /etc/systemd/journald.conf, then: mkdir -p /var/log/journal && systemd-tmpfiles --create --prefix /var/log/journal && systemctl restart systemd-journald."
+    compliance:
+      - cis: ["4.2.2.1"]
+    condition: all
+    rules:
+      - 'f:/etc/systemd/journald.conf -> r:^Storage\s*=\s*persistent'
+
+  - id: 312
+    title: "journald disk usage is bounded (SystemMaxUse configured)"
+    description: "Checks /etc/systemd/journald.conf sets an explicit 'SystemMaxUse' cap rather than leaving journald free to consume up to its (large) default share of the filesystem."
+    rationale: "An unbounded journal can grow to fill the disk on a host generating heavy log volume (e.g. under active attack, which is exactly when you most need logging to keep working), causing a disk-          full condition that can cascade into other service failures and, depending on journald's rate-limiting behavior, silent log loss. A bounded cap makes disk usage predictable and keeps a full disk from becom          ing an unplanned denial-of-service against your own logging."
+    remediation: "Set e.g. 'SystemMaxUse=2G' (size to your log volume and disk capacity) in /etc/systemd/journald.conf, then systemctl restart systemd-journald."
+    compliance:
+      - cis: ["4.2.2.2"]
+    condition: all
+    rules:
+      - 'f:/etc/systemd/journald.conf -> r:^SystemMaxUse\s*=\s*\S+'
+
+  - id: 313
+    title: "journald forwards to syslog for downstream pickup (rsyslog/Wazuh)"
+    description: "Checks /etc/systemd/journald.conf sets 'ForwardToSyslog=yes', so journal entries (including from services that log exclusively via the journal, not files) are also delivered to the classi          c syslog socket that rsyslog — and in turn Wazuh's log collection — reads from."
+    rationale: "Wazuh's standard localfile log collection and your rsyslog forwarding pipeline are both built around traditional syslog-style text logs. Services that log only to the journal (common with m          odern systemd units) are invisible to that pipeline unless journald is explicitly told to mirror entries out to syslog — without this, you get a real gap between 'what's on the host' and 'what the SOC actu          ally sees', independent of whether Wazuh's own journald wodle is also configured."
+    remediation: "Set 'ForwardToSyslog=yes' in /etc/systemd/journald.conf, then systemctl restart systemd-journald. For journal sources Wazuh should read natively instead of via syslog mirroring, configure           a <localfile> block with <log_format>journald</log_format> in the agent's ossec.conf/agent.conf, as a complement to (not replacement for) this forwarding."
+    compliance:
+      - cis: ["custom"]
+    condition: all
+    rules:
+      - 'f:/etc/systemd/journald.conf -> r:^ForwardToSyslog\s*=\s*yes'
