@@ -1,0 +1,96 @@
+policy:
+  id: "itsec_win_filesystem" # Изменили ID с itsec_win_filesystem_hardening
+  file: "itsec_win_filesystem-hardening.yml"
+  name: "ITSEC — Windows Server / Windows 11 Storage & File System Security (ISO 27001)"
+  description: "Custom baseline aligned with ISO/IEC 27001 (Controls A.8.1, A.8.23, A.8.24): Effective disk encryption, AutoRun control, removable media restriction, folder write security, and ransomware protection."
+  references:
+    - https://www.cisecurity.org/benchmark/microsoft_windows_server
+    - https://iso.org
+
+requirements:
+  title: "Windows Operating System Detection"
+  description: "Confirms the host is running Windows by checking a core registry key."
+  condition: all
+  rules:
+    - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion -> ProductName'
+
+checks:
+  # ---------------- Disk Encryption (ISO 27001 A.8.1 / A.8.24) ----------------
+  - id: 1401
+    title: "OS drive is BitLocker-encrypted"
+    description: "Checks the system drive's BitLocker protection status is 'On' via effective WMI/PowerShell status."
+    rationale: "Aligns with ISO 27001 A.8.24 (Use of cryptography). Prevents offline data exposure and credential cache dumping if physical asset security is bypassed."
+    remediation: "Enable BitLocker on the OS drive via GPO or PowerShell: Enable-BitLocker -MountPoint C: -EncryptionMethod XtsAes256."
+    compliance:
+      - cis: ["18.9.5"]
+      - iso_27001: ["A.8.1", "A.8.24"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-BitLockerVolume -MountPoint $env:SystemDrive).ProtectionStatus" -> r:^On$'
+
+  # ---------------- Media & Vector Controls (ISO 27001 A.8.23) ----------------
+  - id: 1402
+    title: "AutoRun disabled for all drive types"
+    description: "Checks NoDriveTypeAutoRun is set to 255 (0xFF) to disable AutoRun globally."
+    rationale: "Prevents automatic execution of malicious payloads from removable or network media vectors."
+    remediation: "Set HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer -> NoDriveTypeAutoRun -> 255."
+    compliance:
+      - cis: ["18.9.8.1"]
+      - iso_27001: ["A.8.23"]
+    condition: all
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer -> NoDriveTypeAutoRun -> 255'
+
+  - id: 1403
+    title: "Write access to removable storage is denied"
+    description: "Checks if effective policy denies write operations to removable media to prevent data exfiltration."
+    rationale: "Aligns with ISO 27001 A.8.23 (Storage media). Restricts unauthorized data transfer to untrusted USB media while maintaining read capability."
+    remediation: "Enable central GPO: System > Removable Storage Access > Removable Disks: Deny write access."
+    compliance:
+      - cis: ["18.9.87.1"]
+      - iso_27001: ["A.8.23"]
+    condition: any
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b} -> Deny_Write -> 1'
+      - 'c:powershell.exe -NoProfile -Command "(Get-ItemProperty -Path ''HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}'' -ErrorAction SilentlyContinue).Deny_Write" -> r:1'
+
+  # ---------------- Privilege Escalation Prevention (ISO 27001 A.8.2) ----------------
+  - id: 1404
+    title: "'Always install with elevated privileges' is disabled"
+    description: "Ensures standard users cannot run MSI installers with full NT AUTHORITY\\SYSTEM rights."
+    rationale: "Prevents local privilege escalation (LPE) techniques via malicious Windows Installer packages."
+    remediation: "Ensure AlwaysInstallElevated is 0 or absent under HKLM and HKCU Windows Installer policies."
+    compliance:
+      - cis: ["18.9.44.1"]
+      - iso_27001: ["A.8.2"]
+    condition: none
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\Installer -> AlwaysInstallElevated -> 1'
+
+  # ---------------- File System Access Control (ISO 27001 A.8.22 - Universal Language SID Fix) ----------------
+  - id: 1405
+    title: "System directory is not writable by the Everyone/Users group at the root"
+    description: "Checks NTFS DACL at drive root using secure language-independent SIDs to identify insecure write permissions."
+    rationale: "Prevents low-privileged processes from dropping binaries into the root of search paths, mitigating DLL hijacking."
+    remediation: "Remove explicit Full/Modify/Write permissions for standard users or 'Everyone' group at the root of C:\\."
+    compliance:
+      - cis: ["custom"]
+      - iso_27001: ["A.8.22"]
+    condition: none
+    rules:
+      # Безопасный опрос через PowerShell по SID: S-1-1-0 (Все) и S-1-5-11 (Прошедшие проверку) независим от локализации ОС (EN/RU)
+      - 'c:powershell.exe -NoProfile -Command "(Get-Acl -Path $env:SystemDrive\).Access | Where-Object { $_.IdentityReference.Value -match ''S-1-1-0|S-1-5-11|Users|Пользователи'' } | ForEach-Object { $_.FileSystemRights.ToString() }" -> r:(FullControl|Modify|Write)'
+
+  # ---------------- Ransomware Protection & Integrity (ISO 27001 A.8.20 / A.8.24) ----------------
+  - id: 1406
+    title: "Controlled Folder Access (ransomware protection) is enabled"
+    description: "Checks if active Defender Exploit Guard component blocks unauthorized file modification."
+    rationale: "Protects critical business data folders from zero-day encryption and unauthorized changes."
+    remediation: "Execute centralized preference: Set-MpPreference -EnableControlledFolderAccess Enabled."
+    compliance:
+      - cis: ["custom"]
+      - iso_27001: ["A.8.20", "A.8.24"]
+    condition: any
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Defender\Windows Defender Exploit Guard\Controlled Folder Access -> EnableControlledFolderAccess -> 1'
+      - 'c:powershell.exe -NoProfile -Command "(Get-MpPreference).EnableControlledFolderAccess" -> r:1'
