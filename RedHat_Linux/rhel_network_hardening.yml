@@ -1,0 +1,181 @@
+policy:
+  id: "itsec_rhel_network_hardening"
+  file: "itsec_rhel_network-hardening.yml"
+  name: "ITSEC — RHEL/Oracle Linux Network Security & Firewall"
+  description: "Custom baseline: sysctl network stack hardening, firewalld/nftables default-deny posture, removal of legacy/unencrypted network services"
+  references:
+    - https://www.cisecurity.org/benchmark/oracle_linux
+
+requirements:
+  title: "Base network stack presence"
+  description: "Confirms sysctl and rpm are available before running checks."
+  condition: all
+  rules:
+    - 'c:sysctl -a -> r:net\.ipv4\.ip_forward'
+
+checks:
+  # ---------------- Sysctl network hardening ----------------
+  - id: 401
+    title: "IPv4 IP forwarding disabled"
+    description: "Checks the live value of net.ipv4.ip_forward is 0."
+    rationale: "IP forwarding turns the host into a router, relaying packets between interfaces/networks it's attached to. On anything other than a deliberately-configured router or gateway host, this is unnecessary attack surface — a compromised host with forwarding enabled can be used to pivot traffic between network segments it shouldn't bridge, undermining network segmentation."
+    remediation: "Set 'net.ipv4.ip_forward = 0' in /etc/sysctl.d/60-network-hardening.conf and apply with 'sysctl -p /etc/sysctl.d/60-network-hardening.conf'. If this host is an intentional router/gateway, document the exception and exclude it from this policy."
+    compliance:
+      - cis: ["3.2.1"]
+    condition: all
+    rules:
+      - 'c:sysctl net.ipv4.ip_forward -> r:=\s*0\s*$'
+
+  - id: 402
+    title: "IPv6 forwarding disabled"
+    description: "Checks the live value of net.ipv6.conf.all.forwarding is 0."
+    rationale: "Same rationale as IPv4 forwarding — an unintended IPv6 router role on a general-purpose host bridges network segments an attacker shouldn't be able to cross, and IPv6 forwarding is frequently overlooked because IPv6 itself is overlooked."
+    remediation: "Set 'net.ipv6.conf.all.forwarding = 0' in /etc/sysctl.d/60-network-hardening.conf and apply with sysctl -p."
+    compliance:
+      - cis: ["3.2.2"]
+    condition: all
+    rules:
+      - 'c:sysctl net.ipv6.conf.all.forwarding -> r:=\s*0\s*$'
+
+  - id: 403
+    title: "TCP SYN cookies enabled (SYN flood protection)"
+    description: "Checks the live value of net.ipv4.tcp_syncookies is 1."
+    rationale: "A SYN flood exhausts the kernel's half-open connection backlog by sending SYN packets without completing the handshake, denying service to legitimate clients. SYN cookies let the kernel avoid holding per-connection state for unacknowledged handshakes, absorbing the flood without the usual backlog-exhaustion denial-of-service effect, at negligible cost to normal traffic."
+    remediation: "Set 'net.ipv4.tcp_syncookies = 1' in /etc/sysctl.d/60-network-hardening.conf and apply with sysctl -p."
+    compliance:
+      - cis: ["3.2.7"]
+    condition: all
+    rules:
+      - 'c:sysctl net.ipv4.tcp_syncookies -> r:=\s*1\s*$'
+
+  - id: 404
+    title: "Source-routed packets rejected"
+    description: "Checks net.ipv4.conf.all.accept_source_route and net.ipv4.conf.default.accept_source_route are both 0."
+    rationale: "IP source routing lets the sender of a packet dictate the path it takes through the network, bypassing normal routing decisions. It has essentially no legitimate use on a modern server and is a known technique for evading network-path-based access controls or spoofing return traffic through an unintended route."
+    remediation: "Set 'net.ipv4.conf.all.accept_source_route = 0' and 'net.ipv4.conf.default.accept_source_route = 0' in /etc/sysctl.d/60-network-hardening.conf, apply with sysctl -p."
+    compliance:
+      - cis: ["3.2.3", "3.2.4"]
+    condition: all
+    rules:
+      - 'c:sysctl net.ipv4.conf.all.accept_source_route -> r:=\s*0\s*$'
+      - 'c:sysctl net.ipv4.conf.default.accept_source_route -> r:=\s*0\s*$'
+
+  - id: 405
+    title: "ICMP redirects ignored (all/default/secure)"
+    description: "Checks net.ipv4.conf.all.accept_redirects, net.ipv4.conf.default.accept_redirects, and net.ipv4.conf.all.secure_redirects are all 0."
+    rationale: "ICMP redirects let another host on the same subnet tell this host to change its routing table for a given destination. Accepting them allows a man-in-the-middle on the local segment to silently reroute this host's outbound traffic through an attacker-controlled path — 'secure' redirects (from a known gateway) are only marginally safer and CIS recommends disabling both variants."
+    remediation: "Set net.ipv4.conf.all.accept_redirects = 0, net.ipv4.conf.default.accept_redirects = 0, and net.ipv4.conf.all.secure_redirects = 0 in /etc/sysctl.d/60-network-hardening.conf, apply with sysctl -p."
+    compliance:
+      - cis: ["3.2.5", "3.2.6"]
+    condition: all
+    rules:
+      - 'c:sysctl net.ipv4.conf.all.accept_redirects -> r:=\s*0\s*$'
+      - 'c:sysctl net.ipv4.conf.default.accept_redirects -> r:=\s*0\s*$'
+      - 'c:sysctl net.ipv4.conf.all.secure_redirects -> r:=\s*0\s*$'
+
+  - id: 406
+    title: "ICMP redirect sending disabled"
+    description: "Checks net.ipv4.conf.all.send_redirects and net.ipv4.conf.default.send_redirects are both 0."
+    rationale: "Sending ICMP redirects is only meaningful for a host acting as a router with multiple routing paths to advertise; on a standard server it serves no purpose and unnecessarily discloses internal routing topology information to anything on the local segment listening for it."
+    remediation: "Set net.ipv4.conf.all.send_redirects = 0 and net.ipv4.conf.default.send_redirects = 0 in /etc/sysctl.d/60-network-hardening.conf, apply with sysctl -p."
+    compliance:
+      - cis: ["3.2.8"]
+    condition: all
+    rules:
+      - 'c:sysctl net.ipv4.conf.all.send_redirects -> r:=\s*0\s*$'
+      - 'c:sysctl net.ipv4.conf.default.send_redirects -> r:=\s*0\s*$'
+
+  - id: 407
+    title: "Broadcast ICMP ignored and martian packets logged"
+    description: "Checks net.ipv4.icmp_echo_ignore_broadcasts is 1 (ignore ICMP echo requests sent to broadcast/multicast addresses) and net.ipv4.conf.all.log_martians is 1 (log packets with impossible/spoofed source addresses)."
+    rationale: "icmp_echo_ignore_broadcasts prevents this host participating in a Smurf-style amplification attack, where an attacker spoofs a victim's source address and broadcasts an ICMP echo request, causing every host on the segment to flood the victim with replies. log_martians surfaces packets with source addresses that couldn't legitimately have reached this interface — a strong indicator of IP spoofing or misconfigured routing worth alerting on."
+    remediation: "Set net.ipv4.icmp_echo_ignore_broadcasts = 1 and net.ipv4.conf.all.log_martians = 1 in /etc/sysctl.d/60-network-hardening.conf, apply with sysctl -p. Ensure martian log lines (kernel: 'martian source') are collected by Wazuh's syslog/journald log source."
+    compliance:
+      - cis: ["3.2.9"]
+    condition: all
+    rules:
+      - 'c:sysctl net.ipv4.icmp_echo_ignore_broadcasts -> r:=\s*1\s*$'
+      - 'c:sysctl net.ipv4.conf.all.log_martians -> r:=\s*1\s*$'
+
+  # ---------------- Firewall: default-deny ----------------
+  - id: 408
+    title: "A firewall management service (firewalld or nftables) is active"
+    description: "Checks that at least one of firewalld or nftables is enabled and running — either is acceptable, but exactly one should be the actively-managed one to avoid conflicting rule sets."
+    rationale: "Without an active packet-filtering service, every listening port on the host is reachable from anywhere network reach permits — there is no enforcement point for a default-deny policy at all. This check is a prerequisite gate for check 409 below."
+    remediation: "Pick one: systemctl enable --now firewalld, OR systemctl enable --now nftables (with your ruleset in /etc/nftables.conf). Do not run both simultaneously — overlapping filtering layers make troubleshooting and auditing rules significantly harder."
+    compliance:
+      - cis: ["4.3.2", "4.4.1.1"]
+    condition: any
+    rules:
+      - 'c:systemctl is-active firewalld -> r:^active$'
+      - 'c:systemctl is-active nftables -> r:^active$'
+
+  - id: 409
+    title: "Firewall default policy is deny (not accept)"
+    description: "Checks that either firewalld's public zone target is DROP/REJECT (not the default ACCEPT), or nftables' input chain has an explicit 'policy drop' base chain hook."
+    rationale: "This is the actual enforcement of 'запрещено все, что не разрешено явно' — a firewall service that's merely running but still defaults to ACCEPT provides no real protection; every port an application opens is reachable unless something else blocks it. A default-deny posture means a newly-installed service with an open listening socket is unreachable from the network until someone explicitly opens it, turning 'forgot to firewall a new service' from a silent exposure into a visible, intentional action."
+    remediation: 'firewalld: firewall-cmd --permanent --zone=public --set-target=DROP (or REJECT for feedback to legitimate clients) && firewall-cmd --reload, then explicitly allow required services: firewall-cmd --permanent --zone=public --add-service=ssh (etc). nftables: ensure your input chain is defined as "chain input { type filter hook input priority 0; policy drop; }" with explicit accept rules above the implicit drop.'
+    compliance:
+      - cis: ["4.3.3", "4.4.2.4"]
+    condition: any
+    rules:
+      - 'c:firewall-cmd --zone=public --list-target -> r:DROP|REJECT|%%REJECT%%'
+      - 'c:nft list ruleset -> r:hook\s+input.*policy\s+drop'
+
+  # ---------------- Legacy/unencrypted service removal ----------------
+  - id: 410
+    title: "IPv6 disabled at the kernel level, if not in use"
+    description: "Checks whether IPv6 is disabled either via sysctl (net.ipv6.conf.all.disable_ipv6=1) or via a kernel boot parameter (ipv6.disable=1 in the GRUB config). This check only makes sense if IPv6 is genuinely unused in your environment — verify that first."
+    rationale: "An enabled-but-unmanaged IPv6 stack is a common blind spot: firewall rules, monitoring, and hardening are often built IPv4-only, so IPv6 traffic can bypass controls nobody remembered exist for it. If IPv6 is not part of your routing/addressing plan, disabling it removes that entire unmonitored attack surface; if you DO use IPv6, do not apply this check — treat it as informational per-environment rather than a blanket pass/fail."
+    remediation: "If IPv6 is confirmed unused: add 'net.ipv6.conf.all.disable_ipv6 = 1' and 'net.ipv6.conf.default.disable_ipv6 = 1' to /etc/sysctl.d/60-network-hardening.conf, and/or add 'ipv6.disable=1' to GRUB_CMDLINE_LINUX in /etc/default/grub followed by 'grub2-mkconfig -o /boot/grub2/grub.cfg'. If IPv6 IS used in your environment, disable/remove this check from the policy rather than leaving it as a permanent false failure."
+    compliance:
+      - cis: ["3.1.1"]
+    condition: any
+    rules:
+      - 'c:sysctl net.ipv6.conf.all.disable_ipv6 -> r:=\s*1\s*$'
+      - 'f:/etc/default/grub -> r:ipv6\.disable=1'
+
+  - id: 411
+    title: "telnet-server not installed"
+    description: "Checks the telnet-server package is not installed."
+    rationale: "Telnet transmits all traffic, including login credentials, in cleartext. Any credential or session data traversing a telnet session is trivially readable to anyone able to observe the network path — there is no scenario on a security-conscious network where telnet is preferable to SSH."
+    remediation: "Remove: dnf remove telnet-server. If a legacy device management workflow genuinely requires telnet, isolate it to a dedicated, tightly access-controlled management VLAN and document the exception explicitly."
+    compliance:
+      - cis: ["2.2.1"]
+    condition: all
+    rules:
+      - 'c:bash -c "rpm -q telnet-server >/dev/null 2>&1; echo $?" -> r:^1$'
+
+  - id: 412
+    title: "FTP and TFTP server packages not installed"
+    description: "Checks that neither vsftpd nor tftp-server is installed."
+    rationale: "Standard FTP, like telnet, transmits credentials and file contents in cleartext (SFTP/FTPS are the encrypted alternatives, but plain FTP is what vsftpd serves by default). TFTP has no authentication at all — anyone who can reach the port can read or write files. Neither belongs on a general-purpose hardened host; use SFTP/SCP over the already-hardened SSH service instead."
+    remediation: "Remove: dnf remove vsftpd tftp-server. If TFTP is required for legitimate PXE/network-boot infrastructure, restrict it to an isolated provisioning network with no route to production segments."
+    compliance:
+      - cis: ["2.2.2", "2.2.3"]
+    condition: all
+    rules:
+      - 'c:bash -c "rpm -q vsftpd >/dev/null 2>&1; echo $?" -> r:^1$'
+      - 'c:bash -c "rpm -q tftp-server >/dev/null 2>&1; echo $?" -> r:^1$'
+
+  - id: 413
+    title: "rsh-server not installed"
+    description: "Checks the rsh-server package (rsh/rlogin/rexec daemons) is not installed."
+    rationale: "The 'r-commands' (rsh, rlogin, rexec) predate any concept of encrypted remote access and, in their classic configuration, can even permit password-less authentication based solely on source IP/hostname (.rhosts trust) — trivially spoofable on any network the attacker has a foothold on. SSH replaces every legitimate use case of the r-commands with actual authentication and encryption."
+    remediation: "Remove: dnf remove rsh-server."
+    compliance:
+      - cis: ["2.2.4"]
+    condition: all
+    rules:
+      - 'c:bash -c "rpm -q rsh-server >/dev/null 2>&1; echo $?" -> r:^1$'
+
+  - id: 414
+    title: "NIS server (ypserv) not installed"
+    description: "Checks the ypserv package (legacy NIS/YP directory service) is not installed."
+    rationale: "NIS (Network Information Service) transmits authentication data, including password hashes, unencrypted across the network and has no meaningful access control model by modern standards — any host on the NIS domain's network can typically query the full user/password database. It has been superseded by LDAP/SSSD/AD-integrated identity for essentially every use case it used to serve."
+    remediation: "Remove: dnf remove ypserv. If centralized identity is needed, use SSSD against LDAP or Active Directory instead."
+    compliance:
+      - cis: ["2.2.5"]
+    condition: all
+    rules:
+      - 'c:bash -c "rpm -q ypserv >/dev/null 2>&1; echo $?" -> r:^1$'
