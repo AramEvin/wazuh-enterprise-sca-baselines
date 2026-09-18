@@ -1,0 +1,141 @@
+policy:
+  id: "itsec_rhel_filesystem_hardening"
+  file: "itsec_rhel_filesystem-hardening.yml"
+  name: "ITSEC — RHEL/Oracle Linux Storage & File System Security"
+  description: "Custom baseline: ACL support, SUID/SGID control, secure mount options for temp filesystems, permissions on critical system config files"
+  references:
+    - https://www.cisecurity.org/benchmark/oracle_linux
+
+requirements:
+  title: "Base filesystem presence"
+  description: "Confirms fstab and passwd-family files exist before running checks."
+  condition: all
+  rules:
+    - 'f:/etc/fstab'
+    - 'f:/etc/passwd'
+
+checks:
+  # ---------------- ACLs ----------------
+  - id: 201
+    title: "ACL utilities installed"
+    description: "Checks that the 'acl' package (getfacl/setfacl) is installed. This is the prerequisite for defining any extended ACL on critical directories or application/database files — without it, only classic owner/group/other permissions can be applied."
+    rationale: "Standard Unix permissions give exactly one owner and one group per object, which is not enough for real-world setups where, e.g., a DB directory needs read access for a backup account, write for the DB service account, and no access for everyone else. Extended ACLs let you grant that without loosening the base permission bits or adding users to unrelated groups. Without the tooling installed, admins are pushed toward group-sharing workarounds that are harder to audit."
+    remediation: "Install: dnf install acl. Then define ACLs per critical path, e.g.: setfacl -R -m u:backup-svc:rx,g:dbadmins:rwx /var/lib/pgsql/data; verify with getfacl <path>. ACL assignments are application-specific and must be defined and reviewed manually per directory — this check only confirms the capability is present."
+    compliance:
+      - cis: ["1.1.23"]
+    condition: all
+    rules:
+      - 'c:rpm -q acl -> r:^acl-'
+
+  - id: 202
+    title: "Filesystem mounted with ACL support (ext4/xfs)"
+    description: "Checks the root filesystem type is ext4 or xfs, both of which support POSIX ACLs natively (acl is a default-on mount feature on these filesystems in RHEL/OL 8+, no explicit 'acl' mount option required)."
+    rationale: "ACLs are meaningless if the underlying filesystem doesn't support extended attributes. Confirming the FS type prevents a false sense of security where setfacl silently fails or is unavailable on an unsupported filesystem (e.g. legacy ext2)."
+    remediation: "If the root filesystem is not ext4/xfs, migrate critical data partitions to one that supports ACLs before relying on setfacl for access control."
+    compliance:
+      - cis: ["1.1.23"]
+    condition: all
+    rules:
+      - 'c:findmnt -n -o FSTYPE / -> r:^ext4$|^xfs$'
+
+  # ---------------- SUID/SGID control ----------------
+  - id: 203
+    title: "No SUID/SGID bit on common privilege-escalation binaries"
+    description: "Scans the root filesystem (single mount, -xdev) for files with the SUID or SGID bit set, and flags matches against a list of interpreters/tools that are classic 'GTFOBins'-style privilege-escalation vectors when made SUID: bash, find, vim/vi, perl, python*, awk/gawk, nc/ncat, nmap. Passes only when the count of matches is 0."
+    rationale: "Attaching SUID to a shell or interpreter (e.g. 'chmod u+s /bin/bash') is one of the most common persistence/privilege-escalation techniques used after initial compromise — it turns any local code-execution foothold into instant root, and it's rarely legitimate on a production server. These binaries have no business being SUID/SGID under normal operation, so any hit here is a strong indicator of either a misconfiguration or an active backdoor."
+    remediation: "Investigate immediately: 'find / -xdev -perm -4000 -o -perm -2000 -type f 2>/dev/null' to list all SUID/SGID files, identify the offending binary from the check output, and remove the bit with 'chmod u-s,g-s <path>' unless there is a documented, reviewed business reason for it."
+    compliance:
+      - cis: ["1.1.6"]
+    condition: all
+    rules:
+      - "c:find / -xdev \\( -perm -4000 -o -perm -2000 \\) -type f 2>/dev/null -> r:/(bash|find|vim|vi|perl|python[0-9.]*|awk|gawk|nc|ncat|nmap)$"
+
+  - id: 204
+    title: "SUID/SGID file inventory does not exceed baseline count"
+    description: "Counts all files on the root filesystem (single mount, -xdev) with SUID or SGID set and compares against a conservative ceiling of 40 — a typical minimal RHEL/OL 9 install has roughly 20-30 such files (ping, sudo, passwd, mount, crontab, etc.)."
+    rationale: "A sudden jump in the total number of SUID/SGID binaries — even ones not on the known-dangerous list from check 3 — is a useful drift indicator: it often means a package was installed that adds setuid tooling (e.g. certain VPN clients, some monitoring agents) or that something was tampered with outside change management. This check is a coarse anomaly signal, not a precise pass/fail gate; tune the threshold to your actual baseline after a first clean scan."
+    remediation: "Run 'find / -xdev \\( -perm -4000 -o -perm -2000 \\) -type f 2>/dev/null | wc -l' to get the current count, document it as your host's baseline, and adjust the threshold in this check (currently 40) accordingly."
+    compliance:
+      - cis: ["1.1.6"]
+    condition: all
+    rules:
+      - "c:find / -xdev \\( -perm -4000 -o -perm -2000 \\) -type f 2>/dev/null | wc -l -> n:^(\\d+)$ compare <= 40"
+
+  # ---------------- Secure mount options ----------------
+  - id: 205
+    title: "/tmp mounted with nodev, nosuid, noexec"
+    description: "Checks the /etc/fstab entry for the /tmp mountpoint includes all three options: nodev, nosuid, noexec."
+    rationale: "/tmp is world-writable by design, making it a favorite drop zone for malicious payloads and exploit staging. nodev blocks device-file abuse, nosuid strips the effect of any SUID/SGID bit on a file written there, and noexec prevents directly executing binaries from it — closing off the most common '/tmp exploit' pattern (write payload to /tmp, chmod +x, run) even if an attacker can write files there."
+    remediation: "Add or edit the /tmp line in /etc/fstab, e.g.: 'tmpfs /tmp tmpfs defaults,nodev,nosuid,noexec 0 0', or if using systemd's tmp.mount, set 'Options=mode=1777,strictatime,nosuid,nodev,noexec' via a drop-in at /etc/systemd/system/tmp.mount.d/override.conf. Remount with 'mount -o remount /tmp' and verify with 'findmnt /tmp'."
+    compliance:
+      - cis: ["1.1.2"]
+    condition: all
+    rules:
+      - 'f:/etc/fstab -> r:\s/tmp\s && r:nodev && r:nosuid && r:noexec'
+
+  - id: 206
+    title: "/var/tmp mounted with nodev, nosuid, noexec"
+    description: "Checks the /etc/fstab entry for the /var/tmp mountpoint includes nodev, nosuid, noexec — or that /var/tmp is bind-mounted to the already-hardened /tmp."
+    rationale: "/var/tmp is functionally identical to /tmp (world-writable scratch space) with the one difference that its contents survive reboots, which if anything makes it a more attractive persistence location for dropped payloads. It needs the same restrictions as /tmp for the same reasons."
+    remediation: "Add a dedicated fstab entry with nodev,nosuid,noexec, or bind-mount it to /tmp: '/tmp /var/tmp none bind 0 0' in /etc/fstab, then 'mount -o remount /var/tmp'."
+    compliance:
+      - cis: ["1.1.3"]
+    condition: all
+    rules:
+      - 'f:/etc/fstab -> r:\s/var/tmp\s && r:nodev && r:nosuid && r:noexec'
+
+  - id: 207
+    title: "/dev/shm mounted with nodev, nosuid, noexec"
+    description: "Checks the /etc/fstab entry for /dev/shm (shared memory tmpfs) includes nodev, nosuid, noexec."
+    rationale: "/dev/shm is a tmpfs that's writable by any local user by default and is a well-documented technique for fileless/in-memory malware staging, since writes there never touch disk. The same nodev/nosuid/noexec restrictions eliminate it as a viable execution staging area, at negligible cost since legitimate use of /dev/shm (shared memory segments, not executable files) is unaffected."
+    remediation: "Ensure /etc/fstab has: 'tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0', then 'mount -o remount /dev/shm'."
+    compliance:
+      - cis: ["1.1.8"]
+    condition: all
+    rules:
+      - 'f:/etc/fstab -> r:\s/dev/shm\s && r:nodev && r:nosuid && r:noexec'
+
+  # ---------------- Critical config file permissions ----------------
+  - id: 208
+    title: "/etc/shadow has restrictive permissions and root ownership"
+    description: "Checks /etc/shadow is owned by root:root (or root:shadow) and has mode 0000 or 0400 — i.e. not readable by any non-root account, including via group membership."
+    rationale: "/etc/shadow holds password hashes for every local account. Any read access beyond root turns an unprivileged local foothold into an offline hash-cracking opportunity against every account on the box, including service and admin accounts. This is one of the highest-value single files to lock down on any Linux host."
+    remediation: "Run: chown root:root /etc/shadow && chmod 0000 /etc/shadow (some distros use 0400 with group root/shadow for specific tooling compatibility — either is acceptable, anything more permissive is not)."
+    compliance:
+      - cis: ["6.1.2"]
+    condition: all
+    rules:
+      - 'c:stat -Lc "%a %U %G" /etc/shadow -> r:^0{1,3}\s+root\s+(root|shadow)$|^400\s+root\s+(root|shadow)$'
+
+  - id: 209
+    title: "/etc/passwd has correct permissions and root ownership"
+    description: "Checks /etc/passwd is owned by root:root and has mode 0644 (world-readable, root-only writable)."
+    rationale: "/etc/passwd must remain world-readable since many standard tools resolve UID-to-username via it, but it must never be group- or world-writable — write access there lets any local user add/modify accounts, effectively granting arbitrary privilege escalation (e.g. inserting a UID-0 entry)."
+    remediation: "Run: chown root:root /etc/passwd && chmod 0644 /etc/passwd."
+    compliance:
+      - cis: ["6.1.3"]
+    condition: all
+    rules:
+      - 'c:stat -Lc "%a %U %G" /etc/passwd -> r:^644\s+root\s+root$'
+
+  - id: 210
+    title: "/etc/gshadow has restrictive permissions and root ownership"
+    description: "Checks /etc/gshadow (group password hashes/admin lists) is owned by root:root (or root:shadow) and has mode 0000 or 0400."
+    rationale: "/etc/gshadow is the group-level analogue of /etc/shadow — it stores group password hashes and group administrator lists. The same exposure risk applies: unrestricted read access allows offline attacks against group passwords and disclosure of group administration structure."
+    remediation: "Run: chown root:root /etc/gshadow && chmod 0000 /etc/gshadow (or 0400 with group root/shadow)."
+    compliance:
+      - cis: ["6.1.4"]
+    condition: all
+    rules:
+      - 'c:stat -Lc "%a %U %G" /etc/gshadow -> r:^0{1,3}\s+root\s+(root|shadow)$|^400\s+root\s+(root|shadow)$'
+
+  - id: 211
+    title: "/etc/fstab has correct permissions and root ownership"
+    description: "Checks /etc/fstab is owned by root:root and has mode 0644."
+    rationale: "/etc/fstab controls what gets mounted where and with which options at boot — including the nodev/nosuid/noexec protections defined in checks 5-7. If it were writable by a non-root user, that user could silently strip those protections or redirect a mountpoint, undermining every other filesystem control in this policy."
+    remediation: "Run: chown root:root /etc/fstab && chmod 0644 /etc/fstab."
+    compliance:
+      - cis: ["6.1.5"]
+    condition: all
+    rules:
+      - 'c:stat -Lc "%a %U %G" /etc/fstab -> r:^644\s+root\s+root$'
