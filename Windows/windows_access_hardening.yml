@@ -1,0 +1,145 @@
+policy:
+  id: "itsec_win_access_hardening"
+  file: "itsec_win_access-hardening.yml"
+  name: "ITSEC — Windows Server / Windows 11 Access Hardening (RDP, Password Policy, UAC, Local Accounts)"
+  description: "Custom baseline: RDP/NLA hardening, Active Directory GPO effective password and lockout policy, UAC enforcement"
+  references:
+    - https://cisecurity.org
+
+requirements:
+  title: "Windows Operating System Detection"
+  description: "Confirms the host is running Windows by checking a core registry key."
+  condition: all
+  rules:
+    - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion -> ProductName'
+
+checks:
+  # ---------------- Active Directory / GPO Effective Password Policy (via secedit) ----------------
+  - id: 1301
+    title: "Minimum password length >= 14"
+    description: "Checks effective local/GPO policy has MinimumPasswordLength set to 14 or more."
+    rationale: "Length is the dominant factor in offline hash-cracking resistance. Reads effective GPO applied settings."
+    remediation: "Configure via GPO: Computer Configuration > Windows Settings > Security Settings > Account Policies > Password Policy > Minimum password length = 14."
+    compliance:
+      - cis: ["1.1.4"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "secedit /export /cfg $env:TEMP\\secpol_itsec.cfg /quiet; (Select-String -Path $env:TEMP\\secpol_itsec.cfg -Pattern \"MinimumPasswordLength\").Line" -> r:MinimumPasswordLength\s*=\s*(1[4-9]|[2-9]\d)'
+
+  - id: 1302
+    title: "Password history >= 24 remembered passwords"
+    description: "Checks effective local/GPO policy has PasswordHistorySize set to 24 or more."
+    rationale: "Prevents defeating mandatory rotation by cycling between a couple of passwords."
+    remediation: "Enforce password history = 24 in GPO."
+    compliance:
+      - cis: ["1.1.1"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "secedit /export /cfg $env:TEMP\\secpol_itsec.cfg /quiet; (Select-String -Path $env:TEMP\\secpol_itsec.cfg -Pattern \"PasswordHistorySize\").Line" -> r:PasswordHistorySize\s*=\s*(2[4-9]|[3-9]\d)'
+
+  - id: 1303
+    title: "Maximum password age is set and bounded (1-365 days)"
+    description: "Checks effective local/GPO policy has MaximumPasswordAge between 1 and 365 days."
+    rationale: "A bounded max age caps the exposure window of leaked credentials."
+    remediation: "Set maximum password age to 365 days or less via GPO."
+    compliance:
+      - cis: ["1.1.2"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "secedit /export /cfg $env:TEMP\\secpol_itsec.cfg /quiet; (Select-String -Path $env:TEMP\\secpol_itsec.cfg -Pattern \"MaximumPasswordAge\").Line" -> r:MaximumPasswordAge\s*=\s*([1-9]|[1-9]\d|[12]\d{2}|3[0-5]\d|36[0-5])'
+
+  - id: 1304
+    title: "Account lockout threshold configured (1-5 attempts)"
+    description: "Checks effective local/GPO policy has LockoutBadCount between 1 and 5 failed attempts."
+    rationale: "Without a threshold, local and RDP-exposed accounts are open to unlimited online brute-forcing."
+    remediation: "Set Account lockout threshold = 5 via GPO."
+    compliance:
+      - cis: ["1.2.2"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "secedit /export /cfg $env:TEMP\\secpol_itsec.cfg /quiet; (Select-String -Path $env:TEMP\\secpol_itsec.cfg -Pattern \"LockoutBadCount\").Line" -> r:LockoutBadCount\s*=\s*[1-5]\b'
+
+  - id: 1305
+    title: "Account lockout duration >= 15 minutes"
+    description: "Checks effective local/GPO policy has LockoutDuration set to 15 minutes or higher."
+    rationale: "Ensures the lockout window is long enough to deter persistent brute-force attempts."
+    remediation: "Set Account lockout duration = 15 (or higher) via GPO."
+    compliance:
+      - cis: ["1.2.1"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "secedit /export /cfg $env:TEMP\\secpol_itsec.cfg /quiet; (Select-String -Path $env:TEMP\\secpol_itsec.cfg -Pattern \"LockoutDuration\").Line" -> r:LockoutDuration\s*=\s*(1[5-9]|[2-9]\d|\d{3,})'
+
+  - id: 1306
+    title: "Password complexity requirement enabled"
+    description: "Checks the exported local security policy (via secedit) has PasswordComplexity=1."
+    rationale: "Complexity requirements alongside length materially raise the cost of cracking."
+    remediation: "Enable 'Password must meet complexity requirements' via GPO."
+    compliance:
+      - cis: ["1.1.5"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "secedit /export /cfg $env:TEMP\\secpol_itsec.cfg /quiet; (Select-String -Path $env:TEMP\\secpol_itsec.cfg -Pattern \"PasswordComplexity\").Line" -> r:PasswordComplexity\s*=\s*1'
+
+  # ---------------- RDP hardening ----------------
+  - id: 1307
+    title: "RDP either disabled, or requires Network Level Authentication"
+    description: "Checks that RDP is fully disabled (fDenyTSConnections=1), OR Network Level Authentication is required (UserAuthentication=1)."
+    rationale: "NLA requires authentication before the full RDP stack is reachable."
+    remediation: "Set fDenyTSConnections to 1, or UserAuthentication to 1."
+    compliance:
+      - cis: ["18.9.65.3.9.2"]
+    condition: any
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server -> fDenyTSConnections -> 1'
+      - 'r:HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp -> UserAuthentication -> 1'
+
+  # ---------------- UAC / privilege escalation controls (Fixed YAML syntax) ----------------
+  - id: 1308
+    title: "User Account Control (UAC) is enabled at admin-approval level"
+    description: "Checks EnableLUA=1 and ConsentPromptBehaviorAdmin is securely configured."
+    rationale: "UAC at 0 means any process running under an administrator token can silently self-elevate."
+    remediation: "Set EnableLUA to 1 and ConsentPromptBehaviorAdmin to 2 under the System Policies registry key."
+    compliance:
+      - cis: ["2.3.17.1", "2.3.17.2"]
+    condition: all
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System -> EnableLUA -> 1'
+      # Проверяем, что значение реестра соответствует безопасным режимам 1 или 2
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System -> ConsentPromptBehaviorAdmin -> 1'
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System -> ConsentPromptBehaviorAdmin -> 2'
+
+  # ---------------- Blank Passwords & Built-in Accounts ----------------
+  - id: 1309
+    title: "Blank-password local accounts cannot log on over the network"
+    description: "Checks LimitBlankPasswordUse=1 under HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa."
+    rationale: "Restricts local accounts with blank passwords to console logon only."
+    remediation: "Set HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa -> LimitBlankPasswordUse -> 1."
+    compliance:
+      - cis: ["2.3.1.3"]
+    condition: all
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Lsa -> LimitBlankPasswordUse -> 1'
+
+  - id: 1310
+    title: "Built-in Guest account is disabled"
+    description: "Checks the local Guest account's Enabled property is False."
+    rationale: "The Guest account is an unnecessary attack surface with zero legitimate use cases."
+    remediation: "PowerShell: Disable-LocalUser -Name 'Guest'."
+    compliance:
+      - cis: ["2.3.1.2"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-LocalUser -Name Guest -ErrorAction SilentlyContinue).Enabled" -> r:^False$|^$'
+
+  # ---------------- Administrators Group Control ----------------
+  - id: 1311
+    title: "Local Administrators group membership is limited"
+    description: "Checks if the number of users in the local Administrators group is within a secure threshold."
+    rationale: "Every additional standing member of the local Administrators group increases risk surface."
+    remediation: "Review local administrators using 'Get-LocalGroupMember -Group Administrators' and remove unnecessary accounts."
+    compliance:
+      - cis: ["2.3.1.1"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-LocalGroupMember -Group Administrators).Count" -> r:^[1-3]$'
