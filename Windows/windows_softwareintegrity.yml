@@ -1,0 +1,105 @@
+policy:
+  id: "itsec_win_software_iso27001"
+  file: "itsec_win_software-integrity.yml"
+  name: "ITSEC — Windows Server / Windows 11 Software & Integrity Management (ISO 27001 Ready)"
+  description: "Custom baseline aligned with ISO/IEC 27001 (Controls A.8.19, A.8.3, A.8.7): Trusted updates, AppLocker enforcement, Windows Defender state, legacy/dev features removal."
+  references:
+    - https://www.cisecurity.org/benchmark/microsoft_windows_server
+    - https://iso.org
+
+requirements:
+  title: "Windows Operating System Detection"
+  description: "Confirms the host is running Windows by checking a core registry key."
+  condition: all
+  rules:
+    - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion -> ProductName'
+
+checks:
+  # ---------------- Update Source Trust (ISO 27001 A.8.19) ----------------
+  - id: 1701
+    title: "Automatic Updates are not disabled"
+    description: "Checks active state of automatic updates via Windows Update Agent API to bypass empty GPO registry paths."
+    rationale: "Aligns with ISO 27001 A.8.19 (Technical vulnerability management). Ensures that the patching engine is actively running."
+    remediation: "Configure GPO: Computer Configuration > Administrative Templates > Windows Components > Windows Update > Configure Automatic Updates = Enabled."
+    compliance:
+      - cis: ["18.9.108.1.1"]
+      - iso_27001: ["A.8.19"]
+    condition: none
+    rules:
+      # Запрашиваем состояние автообновлений напрямую через API ОС
+      - "c:powershell.exe -NoProfile -Command \"(New-Object -ComObject 'Microsoft.Update.AutoUpdate').Settings.NotificationLevel\" -> r:^1$"
+  # ---------------- Application Control (ISO 27001 A.8.3) ----------------
+  - id: 1702
+    title: "AppLocker has at least one enforced rule collection"
+    description: "Checks active AppLocker configuration via PowerShell to ensure default-deny application policy is present."
+    rationale: "Aligns with ISO 27001 A.8.3 (Access control). Enforces application allow-listing to prevent unauthorized binary execution."
+    remediation: "Configure AppLocker rule collections via central domain GPO or local security policy."
+    compliance:
+      - cis: ["custom"]
+      - iso_27001: ["A.8.3"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-AppLockerPolicy -Effective).RuleCollections.Count" -> n:^(\d+)$ compare >= 1'
+
+  # ---------------- Antimalware Protections (ISO 27001 A.8.7) ----------------
+  - id: 1703
+    title: "Windows Defender real-time protection is enabled"
+    description: "Checks real-time protection directly from Defender settings bypassing empty GPO registry keys."
+    rationale: "Aligns with ISO 27001 A.8.7 (Protection against malware). Confirms active heuristics and signature-based engine state."
+    remediation: "Execute centralized GPO preference: Turn off real-time protection = Disabled."
+    compliance:
+      - cis: ["18.9.47.5.1"]
+      - iso_27001: ["A.8.7"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-MpPreference).DisableRealtimeMonitoring" -> r:^False$|^0$'
+
+  - id: 1704
+    title: "Windows Defender signature definitions are current (< 7 days old)"
+    description: "Checks Get-MpComputerStatus reports AntivirusSignatureAge of 7 days or fewer."
+    rationale: "Aligns with ISO 27001 A.8.7. Prevents protection blind spots caused by outdated signature states."
+    remediation: "Confirm network connectivity to internal WSUS or public Microsoft Update endpoints."
+    compliance:
+      - cis: ["custom"]
+      - iso_27001: ["A.8.7"]
+    condition: all
+    rules:
+      - 'c:powershell.exe -NoProfile -Command "(Get-MpComputerStatus).AntivirusSignatureAge" -> n:^(\d+)$ compare <= 7'
+
+  # ---------------- Attack Surface & Legacy Removal (ISO 27001 A.8.21) ----------------
+  - id: 1705
+    title: "PowerShell version 2 engine is removed"
+    description: "Checks registry key state for PowerShell v2 to eliminate anti-logging downgrade vectors."
+    rationale: "Prevents attackers from utilizing downgrade vectors to completely bypass Script Block Logging and AMSI."
+    remediation: "Run command: Disable-WindowsOptionalFeature -Online -FeatureName MicrosoftWindowsPowerShellV2Root."
+    compliance:
+      - cis: ["18.3.2"]
+      - iso_27001: ["A.8.21"]
+    condition: all
+    rules:
+      # Проверка напрямую через системный куст реестра полностью независима от локализации и языка ОС
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\PowerShell\1\PowerShellEngine -> PowerShellVersion -> !r:^2\.'
+
+  - id: 1706
+    title: "Telnet Client feature not installed"
+    description: "Checks Telnet capability status in the registry."
+    rationale: "Eliminates unencrypted management packages from production infrastructure."
+    remediation: "Disable-WindowsOptionalFeature -Online -FeatureName TelnetClient."
+    compliance:
+      - cis: ["18.3.3"]
+      - iso_27001: ["A.8.21"]
+    condition: none
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages -> r:Telnet-Client -> r:^.*CurrentState\s*=\s*(112|7)$'
+
+  - id: 1707
+    title: "Windows Subsystem for Linux (WSL) not enabled, if not operationally required"
+    description: "Checks registry configuration states for active WSL component status."
+    rationale: "Reduces server environment attack surfaces by preventing unmonitored container/hypervisor execution."
+    remediation: "Disable-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux."
+    compliance:
+      - cis: ["custom"]
+      - iso_27001: ["A.8.21"]
+    condition: all
+    rules:
+      - 'r:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\Packages -> r:Microsoft-Windows-Subsystem-Linux -> r:^.*CurrentState\s*=\s*([0-6])$'
